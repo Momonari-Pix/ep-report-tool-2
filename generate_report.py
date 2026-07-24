@@ -97,6 +97,13 @@ def get_segment(days):
     return '3年以上'
 
 # ── SMSターゲット種別（最大離反期間・バースデー特別処理）────────
+# キャンペーン名ごとの設置台数比率の既定値（備考の「台数の○%」があればそちらを優先）
+# VIP会員・入会サンクスは1ヶ月未満来店を対象に、設置台数の一定割合を母数とする。
+DEFAULT_MACHINE_RATIO = {
+    'VIP会員':   0.20,
+    '入会サンクス': 0.10,
+}
+
 def load_campaign_targets(xlsx_path):
     """SMSターゲット.xlsx を読み込み、種別リストを返す
     戻り値: [{'name': str, 'max_seg': str, 'birthday': bool}, ...]
@@ -113,7 +120,14 @@ def load_campaign_targets(xlsx_path):
         max_seg = str(row[1]).strip() if row[1] else '1〜3年'
         note    = str(row[2]).strip() if row[2] else ''
         birthday = '12分の1' in note or 'バースデー' in name
-        result.append({'name': name, 'max_seg': max_seg, 'birthday': birthday})
+        # 設置台数比率：備考の「台数の○%にする」を最優先。無ければ名前ベースの既定値。
+        mratio = None
+        _mr = re.search(r'台数の\s*(\d+(?:\.\d+)?)\s*[%％]', note)
+        if _mr:
+            mratio = float(_mr.group(1)) / 100
+        elif name in DEFAULT_MACHINE_RATIO:
+            mratio = DEFAULT_MACHINE_RATIO[name]
+        result.append({'name': name, 'max_seg': max_seg, 'birthday': birthday, 'machine_ratio': mratio})
     return result
 
 # ── 会員データ（台数別推定）────────────────────
@@ -1006,10 +1020,17 @@ def inject_segments(html, segments):
     return re.sub(pattern, lambda m: replacement, html, flags=re.DOTALL)
 
 def inject_unsent_segments(html, segments, member_estimates, visit_rate_data, measurement_days,
-                           max_segment=None, birthday_mode=False):
+                           max_segment=None, birthday_mode=False, machine_ratio=None, machines=None,
+                           opt_in_rate=0.70):
     """設置台数ベースの推定会員数と送信済み数から未送信層を計算してDATAに注入。
     max_segment: この離反期間を超えるセグメントはシミュレーションに含めない
     birthday_mode: True の場合、追加対象人数を 1/12 に補正（誕生日月限定施策）
+    machine_ratio: 設定時（VIP会員=0.20 / 入会サンクス=0.10 など）は、対象人数を
+                   設置台数×比率で算出する（全国データ推定は使わない）
+    machines: 設置台数（machine_ratio 使用時に必要）
+    opt_in_rate: SMSオプトイン上限（既定0.70）。全会員がSMSにオプトインしている
+                 わけではないため、全キャンペーン共通で母数に70%を掛けて圧縮する
+                 （全国データ推定・VIP会員/入会サンクスの台数比率の双方に適用）。
     """
     ref_days = min(measurement_days, 30) if measurement_days else None
 
@@ -1022,13 +1043,19 @@ def inject_unsent_segments(html, segments, member_estimates, visit_rate_data, me
     for i, label in enumerate(SEG_ORDER):
         if label == '3年以上': continue
         if i > max_idx: continue  # キャンペーン種別の最大対象期間を超えたらスキップ
-        est_total = member_estimates.get(label, 0)
         seg = next((s for s in segments if s['label'] == label), None)
         sent_count = seg['sent'] if seg else 0
+        if machine_ratio and machines:
+            # VIP会員・入会サンクス：設置台数×比率（例 20%/10%）に、
+            # SMSオプトイン率70%も同様に適用（全キャンペーンで70%ルールを統一）
+            est_total = round(machines * machine_ratio * opt_in_rate)
+        else:
+            # 全国データ推定にSMSオプトイン率70%を適用して圧縮
+            est_total = round(member_estimates.get(label, 0) * opt_in_rate)
         unsent_count = max(0, est_total - sent_count)
         if unsent_count == 0: continue
-        # バースデー施策：誕生日月のお客様のみ対象 → 1/12 に補正
-        if birthday_mode:
+        # バースデー施策：誕生日月のお客様のみ対象 → 1/12 に補正（台数比率指定時は適用しない）
+        if birthday_mode and not machine_ratio:
             unsent_count = max(1, unsent_count // 12)
         if visit_rate_data and ref_days:
             card_rate = visit_rate_data.get(ref_days, {}).get(label, CARD_RATES.get(label, 0.1))
@@ -1150,11 +1177,13 @@ def generate_report_core(
 
     max_segment   = None
     birthday_mode = False
+    machine_ratio = None
     if campaign_type:
         matched = next((ct for ct in campaign_targets if ct['name'] == campaign_type), None)
         if matched:
             max_segment   = matched['max_seg']
             birthday_mode = matched['birthday']
+            machine_ratio = matched.get('machine_ratio')
 
     if machines:
         meta['machines'] = machines
@@ -1162,7 +1191,8 @@ def generate_report_core(
         member_estimates = load_member_estimates(member_file, machines)
         html = inject_unsent_segments(html, segments, member_estimates, visit_rate_data,
                                       meta.get('measurementDays', 0),
-                                      max_segment=max_segment, birthday_mode=birthday_mode)
+                                      max_segment=max_segment, birthday_mode=birthday_mode,
+                                      machine_ratio=machine_ratio, machines=machines)
         if campaign_type:
             html = inject_campaign_meta(html, campaign_type, max_segment or '')
 
@@ -1331,6 +1361,7 @@ def main():
         # キャンペーン種別：未指定ならプロンプト
         max_segment   = None
         birthday_mode = False
+        machine_ratio = None
         if campaign_targets and not args.campaign_type:
             print('\n📋 SMSの内容を選択してください:')
             for i, ct in enumerate(campaign_targets, 1):
@@ -1343,6 +1374,7 @@ def main():
                     args.campaign_type = selected['name']
                     max_segment        = selected['max_seg']
                     birthday_mode      = selected['birthday']
+                    machine_ratio      = selected.get('machine_ratio')
                     print(f'   → 選択: {args.campaign_type}（最大 {max_segment}）')
             except (ValueError, EOFError):
                 print('⚠️  種別未選択のため全セグメントを対象とします')
@@ -1351,6 +1383,7 @@ def main():
             if matched:
                 max_segment   = matched['max_seg']
                 birthday_mode = matched['birthday']
+                machine_ratio = matched.get('machine_ratio')
                 print(f'📋 キャンペーン種別: {args.campaign_type}（最大 {max_segment}）')
             else:
                 print(f'⚠️  キャンペーン種別 "{args.campaign_type}" が見つかりません。全セグメントを対象とします')
@@ -1362,7 +1395,8 @@ def main():
         member_estimates = load_member_estimates(member_file, args.machines)
         html = inject_unsent_segments(html, segments, member_estimates, visit_rate_data,
                                       meta.get('measurementDays', 0),
-                                      max_segment=max_segment, birthday_mode=birthday_mode)
+                                      max_segment=max_segment, birthday_mode=birthday_mode,
+                                      machine_ratio=machine_ratio, machines=args.machines)
         print(f'   → 未送信層シミュレーションデータを注入完了')
         if args.campaign_type:
             html = inject_campaign_meta(html, args.campaign_type, max_segment or '')
