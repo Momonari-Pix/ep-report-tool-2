@@ -228,7 +228,8 @@ def parse_ko_xlsx(filepath, visit_rate_data=None):
                 col = cell.column
                 for r in range(cell.row + 1, cell.row + 10):
                     val = ws1.cell(row=r, column=col).value
-                    if isinstance(val, (int, float)) and val > 100:
+                    # ラベル直下の最初の正の数値を採用（予約数が100以下でも取得できるよう閾値を1に）
+                    if isinstance(val, (int, float)) and val >= 1:
                         meta['reserved'] = int(val)
                         break
 
